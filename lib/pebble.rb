@@ -1,95 +1,49 @@
 # frozen_string_literal: true
-require 'rack'
-require 'singleton'
 require_relative "pebble/version"
 
 module Pebble
-  class Error < StandardError; end
+  TOP_LEVEL_BINDING = binding unless defined?(TOP_LEVEL_BINDING)
+  @route_table = {}
 
-  class Router
-    include Singleton
+  class << self
+    def routes(&block)
+      routes = Hash.new { |h, k| h[k] = {} }
 
-    def initialize
-      @routes = {}
+      define_singleton_method(:define_route) do |method, path, ref|
+        routes[method][path] = resolve(ref)
+      end
+
+      define_singleton_method(:get)    { |path, ref| define_route("GET", path, ref) }
+      define_singleton_method(:post)   { |path, ref| define_route("POST", path, ref) }
+      define_singleton_method(:put)    { |path, ref| define_route("PUT", path, ref) }
+      define_singleton_method(:delete) { |path, ref| define_route("DELETE", path, ref) }
+
+      instance_eval(&block)
+
+      @route_table.merge!(routes)
     end
 
-    def add_route(verb, path, &block)
-      @routes[verb] ||= {}
-      @routes[verb][path] = block
-    end
-
-    def find_route(verb, path)
-      @routes.dig(verb, path)
-    end
-
-    def call(env)
-      request = Rack::Request.new(env)
-      verb = request.request_method.downcase.to_sym
-      path = request.path_info
-
-      if block = find_route(verb, path)
-        [200, {}, block.call]
+    def resolve(handler_ref)
+      case handler_ref
+      when Symbol
+        TOP_LEVEL_BINDING.eval("method(:#{handler_ref})")
+      when Proc
+        handler_ref
       else
-        [404, { "content-type" => "text/plain" }, ["Not Found"]]
+        raise ArgumentError, "Invalid handler reference: #{handler_ref.inspect}"
       end
     end
-  end
 
-  class Application
-    attr_reader :response
+    def run
+      -> (env) do
+        path = env['PATH_INFO']
+        method = env['REQUEST_METHOD']
 
-    def initialize
-      @response = Rack::Response.new
-    end
+        handler = @route_table.dig(method, path)
+        return [404, { "content-type" => "text/plain" }, ["Not Found"]] unless handler
 
-    def call(env)
-      dup.call!(env)
-    end
-
-    def call!(env)
-      code, headers, body = self.class.router.call(env)
-      @response.status = code
-      @response.headers.merge!(headers)
-      @response.write(body)
-      @response.finish
-    end
-
-    def get(path, &block)
-      self.class.get(path, &block)
-    end
-
-    class << self
-      def prototype
-        @prototype ||= new
-      end
-
-      def call(env)
-        synchronize { prototype.call(env) }
-      end
-
-      def lock!
-        @lock = true
-      end
-
-      def lock?
-        @lock
-      end
-
-      @@mutex = Mutex.new
-      def synchronize(&block)
-        if lock?
-          @@mutex.synchronize(&block)
-        else
-          yield
-        end
-      end
-
-      def router
-        @router ||= Router.instance
-      end
-
-      def get(path, &block)
-        router.add_route(:get, path, &block)
+        response = handler.call
+        [200, { "content-type" => "text/plain" }, [response]]
       end
     end
   end
